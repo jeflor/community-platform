@@ -48,7 +48,7 @@ export function EditableSidebarSectionsList({
   topNavItems = [],
 }: EditableSidebarSectionsListProps) {
   const pathname = usePathname();
-  // For admins not previewing, we're always in edit mode (the reference platform style)
+  // For admins not previewing, we're always in edit mode
   const isEditMode = isAdmin && !isPreviewing;
   const [sections, setSections] = useState(initialSections);
   const [topNav, setTopNav] = useState<TopNavItem[]>(topNavItems);
@@ -1029,7 +1029,7 @@ function EditSectionNameModal({
   );
 }
 
-// Edit Item Modal (reference-style)
+// Edit Item Modal
 function EditItemModal({
   item,
   sectionId,

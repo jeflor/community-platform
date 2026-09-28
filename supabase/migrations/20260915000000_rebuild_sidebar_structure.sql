@@ -1,4 +1,4 @@
--- Rebuild sidebar to match the reference platform 2026-09-15 structure
+-- Rebuild sidebar sections and items into the current default structure
 -- This migration rebuilds sidebar_sections and sidebar_items to reflect the current source inventory
 
 -- Delete existing sections (CASCADE will delete items)

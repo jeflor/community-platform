@@ -1,8 +1,80 @@
 # Community Platform
 
-Self-hosted client community platform built with Next.js, TypeScript, Tailwind CSS, and Supabase.
+A self-hosted full-stack community platform built with Next.js, TypeScript, Supabase/PostgreSQL, and Tailwind CSS.
 
-**Canonical Repository:** https://github.com/jeflor/community-platform.git
+It provides what a hosted community SaaS provides — courses, events, discussion, direct messaging, and paid content gating — as an owned codebase, so access rules, data, and billing integration stay under the operator's control.
+
+**Scope:** 39 routes · 84 components · 24 server-action modules · ~37k lines of TypeScript · 61 migrations defining 46 tables, 186 RLS policies, and 46 PostgreSQL functions.
+
+## Technical highlights
+
+- **Next.js 15 App Router** — server components by default, route groups per shell area
+- **TypeScript** — `strict: true`, typechecking clean under `tsc --noEmit`
+- **PostgreSQL / Supabase** — schema managed as 61 ordered, idempotent migrations
+- **Supabase Auth** — email/password and magic link, with cookie-based SSR sessions
+- **PostgreSQL Row Level Security** — enabled on all 46 tables; 186 policies
+- **Role and group-based authorization** — three roles plus composable access groups as the single entitlement primitive
+- **Realtime messaging** — Supabase Realtime subscriptions for channels, threads, and DMs
+- **Server Actions** — 24 colocated mutation modules; API routes reserved for true HTTP endpoints
+- **Stripe webhook integration** — signature-verified checkout and subscription lifecycle handling
+- **Resend email integration** — transactional templates behind a job runner, optional at runtime
+- **Database migrations** — every schema and policy change version-controlled and replayable
+- **Zod validation** — schemas validate server-action input before it reaches the database
+
+## Architecture
+
+```
+Browser
+  │  server components render; client components subscribe to Realtime
+  ▼
+Next.js 15 (App Router)
+  │  Server Actions for mutations  ·  API routes for webhooks & OAuth callbacks
+  ▼
+Supabase client (per-request, cookie-scoped auth context)
+  │  every query carries the caller's JWT
+  ▼
+PostgreSQL
+     Row Level Security evaluates each query against the caller
+     SECURITY DEFINER functions encode the access rules
+     Triggers emit notifications and sync entitlements
+```
+
+The load-bearing decision is that **authorization lives in the database, not the application.** Access rules are `SECURITY DEFINER` PostgreSQL functions — `can_see_document()`, `can_access_lesson()`, `can_see_event()`, `has_course_access()`, `can_access_dm_thread()` — which RLS policies call. Requests reach Postgres carrying the caller's JWT, so a query is evaluated as that user.
+
+*Why:* with 39 routes and 24 action modules touching the same tables, an application-layer check is one forgotten `if` away from a data leak. In the database, a missed check fails closed — the query returns zero rows instead of someone else's data.
+
+*Cost:* authorization logic lives in SQL, which is harder to read and to unit-test than TypeScript. Those functions are where a reviewer should be most skeptical.
+
+A second decision follows from it: **entitlements are group membership, not a purchase lookup.** A Stripe purchase never gets consulted at read time — a trigger writes `group_members` rows tagged `source = 'stripe'` and removes them when the purchase lapses. Every gate in the system then asks one question, "is this user in this group?", whether access came from a purchase, an admin grant, or a signup link.
+
+## Selected implementation areas
+
+**Authentication and authorization** — [lib/supabase/middleware.ts](lib/supabase/middleware.ts) refreshes the session on every request and enforces the deactivation and forced-onboarding gates, preserving auth cookies across redirects. [lib/auth/require-admin.ts](lib/auth/require-admin.ts) guards admin routes.
+
+**RLS and group-based access** — [20240102000000_add_admin_helper.sql](supabase/migrations/20240102000000_add_admin_helper.sql) is the clearest entry point: the naive "admins can read all users" policy recurses, because evaluating it requires reading `users`. A `SECURITY DEFINER` function breaks the cycle, a pattern reused throughout. [20260912020000_add_documents.sql](supabase/migrations/20260912020000_add_documents.sql) shows the gating shape end to end — admin bypass, published check, "no groups means everyone", then group intersection. Two system groups, `everyone` and `team`, are maintained by trigger rather than by application code.
+
+**Realtime messaging** — [components/chat/ChatView.tsx](components/chat/ChatView.tsx) and [components/dm/DMThreadView.tsx](components/dm/DMThreadView.tsx) subscribe to Postgres changes for live channels, threads, and direct messages. Thread access is itself an RLS function, so a subscription cannot surface a message the caller could not have queried.
+
+**Stripe event handling** — [app/api/stripe/webhook/route.ts](app/api/stripe/webhook/route.ts) verifies signatures before doing any work and handles checkout completion, subscription updates and deletion, and payment failure with a grace period. The entitlement side is [20240107000000_phase4_stripe_products.sql](supabase/migrations/20240107000000_phase4_stripe_products.sql), where a trigger translates purchase state into group membership and `REVOKE EXECUTE` keeps that function out of reach of client roles.
+
+**Admin and content management** — in-context editing for courses, lessons, documents, banners, navigation, and the sidebar, plus invite and signup links. The piece worth a look is [lib/preview/preview-helpers.ts](lib/preview/preview-helpers.ts): admins can browse as any access group, because gating bugs are otherwise invisible to the person configuring them — an admin bypasses every check.
+
+**Concurrency** — [20260912130100_event_waitlist_functions.sql](supabase/migrations/20260912130100_event_waitlist_functions.sql) is the one genuinely concurrent path. Two simultaneous cancellations must not promote the same waitlisted user twice, so the capacity check and the promotion happen in one transaction inside Postgres rather than as read-then-write from the application.
+
+## Known gaps
+
+Stated plainly, since a reviewer will find them:
+
+- **No automated test suite.** Correctness currently rests on RLS enforcement plus a manual test checklist. This is the gap I would close first.
+- **The Stripe webhook is not idempotent.** Signatures are verified, but events are not deduplicated by ID, so a replay would be processed twice.
+- **Zod coverage is partial** — 7 of 24 action modules validate with schemas; the rest rely on TypeScript types and database constraints.
+- **~60 `any` annotations remain**, mostly where Supabase join results are reshaped in page components. They typecheck, but they are unchecked at the boundary where shape errors actually occur.
+- **The service-role client bypasses RLS** ([lib/supabase/admin.ts](lib/supabase/admin.ts)). It is confined to authorization lookups where RLS would recurse, but that confinement is a convention, not something the type system enforces.
+- **The admin preview cookie is `httpOnly` but unsigned** — its integrity depends on the admin check at the point it is set.
+
+> **About the rest of this README:** everything below is the detailed build log, organized by the phase in which each subsystem was built — schema notes, per-phase decisions, and manual test checklists. Setup instructions are under [Setup Instructions](#setup-instructions).
+
+---
 
 ## Phase 1 Features
 
@@ -47,7 +119,7 @@ Self-hosted client community platform built with Next.js, TypeScript, Tailwind C
 - Role-based access control via RLS
 - System group auto-management (everyone, team)
 
-**Recent Fixes (PRs #2-#7 + polish):**
+**Hardening pass:**
 - Fixed auth contrast issues
 - Fixed profile creation and reading via RLS
 - Fixed admin authorization checks
@@ -64,7 +136,7 @@ Self-hosted client community platform built with Next.js, TypeScript, Tailwind C
 **Testing Notes:**
 - Apply migrations in order: `20240101000000_init_schema.sql`, `20240102000000_add_admin_helper.sql`, `20240103000000_fix_rls_and_schema.sql`
 - First user needs manual promotion to admin via SQL (see Setup Instructions)
-- Admin admin@example.com can log in and manage members/groups/settings
+- An admin user can log in and manage members, groups, and settings
 - Build passes with `npm run build`
 
 ## Phase 7: Email Notifications (Scaffolded)
@@ -90,13 +162,13 @@ Self-hosted client community platform built with Next.js, TypeScript, Tailwind C
 - No marketing blast UI (kept minimal per spec)
 
 ✅ **What's NOT Included**
-- No live email sends in this scaffold (requires `RESEND_API_KEY` from Chris)
+- No live email sends until `RESEND_API_KEY` is configured for your own Resend project
 - No `email_log` table (skipped per spec)
 - No cron jobs for event reminders (stub function ready for future implementation)
 - No migration changes (reuses existing `notification_prefs` table)
 
 **Environment Variable Required for Live Delivery:**
-- `RESEND_API_KEY`: Your Resend API key (contact Chris)
+- `RESEND_API_KEY`: Your Resend API key
 - `EMAIL_FROM`: (Optional) From email address override
 
 **Testing:**
@@ -209,42 +281,42 @@ npm start
 
 \`\`\`
 community-platform/
-├── app/                        # Next.js App Router pages
-│   ├── auth/                   # Authentication pages (login, signup, callback)
-│   ├── dashboard/              # Protected dashboard pages
-│   │   ├── members/            # Admin: Member management
-│   │   ├── groups/             # Admin: Group management
-│   │   ├── channels/           # Admin: Channel management
-│   │   ├── courses/            # Admin: Course management
-│   │   └── settings/           # Admin: Site settings
-│   ├── chat/                   # Chat channel pages
-│   ├── courses/                # Member course catalog and player
-│   ├── api/                    # API routes
-│   └── globals.css             # Global styles
-├── components/                 # React components
-│   ├── admin/                  # Admin-specific components
-│   ├── chat/                   # Chat components
-│   └── sidebar/                # Sidebar components
-├── lib/                        # Utilities and libraries
-│   ├── actions/                # Server actions
-│   │   ├── auth.ts             # Authentication actions
-│   │   ├── admin.ts            # Admin actions
-│   │   ├── user.ts             # User actions
-│   │   ├── channels.ts         # Channel actions
-│   │   ├── messages.ts         # Message actions
-│   │   └── courses.ts          # Course actions
-│   ├── auth/                   # Auth utilities
-│   └── supabase/               # Supabase client utilities
-├── supabase/                   # Database migrations
-│   └── migrations/
-│       ├── 20240101000000_init_schema.sql
-│       ├── 20240102000000_add_admin_helper.sql
-│       ├── 20240103000000_fix_rls_and_schema.sql
-│       ├── 20240104000000_add_chat_tables.sql
-│       └── 20240105000000_add_courses_tables.sql
-├── config/                     # Configuration files
-│   └── banners.ts              # Banner configuration
-├── middleware.ts               # Auth middleware
+├── app/ # Next.js App Router pages
+│ ├── auth/ # Authentication pages (login, signup, callback)
+│ ├── dashboard/ # Protected dashboard pages
+│ │ ├── members/ # Admin: Member management
+│ │ ├── groups/ # Admin: Group management
+│ │ ├── channels/ # Admin: Channel management
+│ │ ├── courses/ # Admin: Course management
+│ │ └── settings/ # Admin: Site settings
+│ ├── chat/ # Chat channel pages
+│ ├── courses/ # Member course catalog and player
+│ ├── api/ # API routes
+│ └── globals.css # Global styles
+├── components/ # React components
+│ ├── admin/ # Admin-specific components
+│ ├── chat/ # Chat components
+│ └── sidebar/ # Sidebar components
+├── lib/ # Utilities and libraries
+│ ├── actions/ # Server actions
+│ │ ├── auth.ts # Authentication actions
+│ │ ├── admin.ts # Admin actions
+│ │ ├── user.ts # User actions
+│ │ ├── channels.ts # Channel actions
+│ │ ├── messages.ts # Message actions
+│ │ └── courses.ts # Course actions
+│ ├── auth/ # Auth utilities
+│ └── supabase/ # Supabase client utilities
+├── supabase/ # Database migrations
+│ └── migrations/
+│ ├── 20240101000000_init_schema.sql
+│ ├── 20240102000000_add_admin_helper.sql
+│ ├── 20240103000000_fix_rls_and_schema.sql
+│ ├── 20240104000000_add_chat_tables.sql
+│ └── 20240105000000_add_courses_tables.sql
+├── config/ # Configuration files
+│ └── banners.ts # Banner configuration
+├── middleware.ts # Auth middleware
 └── package.json
 \`\`\`
 
@@ -403,35 +475,35 @@ community-platform/
 ### How to Test Phase 2
 
 1. **Run the new migration:**
-   ```bash
-   supabase db push
-   # Or manually execute: supabase/migrations/20240103000000_add_chat_tables.sql
-   ```
+ ```bash
+ supabase db push
+ # Or manually execute: supabase/migrations/20240103000000_add_chat_tables.sql
+ ```
 
 2. **Create channels as admin:**
-   - Go to `/dashboard/channels`
-   - Click "Create Channel"
-   - Set name, slug, type (chat or thread), and assign groups
-   - Users in assigned groups will see the channel in the sidebar
+ - Go to `/dashboard/channels`
+ - Click "Create Channel"
+ - Set name, slug, type (chat or thread), and assign groups
+ - Users in assigned groups will see the channel in the sidebar
 
 3. **Test chat channels:**
-   - Navigate to a chat channel from the sidebar
-   - Send messages, edit your own, delete messages
-   - Add emoji reactions by hovering over messages
-   - Test @mentions with autocomplete (type `@` and start typing a user's name)
-   - Watch real-time updates in another browser/incognito window
+ - Navigate to a chat channel from the sidebar
+ - Send messages, edit your own, delete messages
+ - Add emoji reactions by hovering over messages
+ - Test @mentions with autocomplete (type `@` and start typing a user's name)
+ - Watch real-time updates in another browser/incognito window
 
 4. **Test thread channels:**
-   - Navigate to a thread channel from the sidebar
-   - Start a new thread (top-level post)
-   - Click "Show replies" to expand a thread
-   - Add replies to a thread
-   - Collapse threads to clean up the view
+ - Navigate to a thread channel from the sidebar
+ - Start a new thread (top-level post)
+ - Click "Show replies" to expand a thread
+ - Add replies to a thread
+ - Collapse threads to clean up the view
 
 5. **Test group-based access:**
-   - Create a channel assigned to a specific group
-   - Verify users not in that group can't see the channel
-   - Add a user to the group and verify the channel appears
+ - Create a channel assigned to a specific group
+ - Verify users not in that group can't see the channel
+ - Add a user to the group and verify the channel appears
 
 ### Known Gaps in Phase 2
 
@@ -448,52 +520,52 @@ community-platform/
 - Thread view doesn't show reply preview before expansion
 
 
-## Phase 3 Features (Courses System) - Polished with reference UX
+## Phase 3 Features (Courses System)
 
-✅ **Member Course Experience (reference-style UX)**
+✅ **Member Course Experience**
 - **Course Catalog** (`/courses`):
-  - Collapsible sections to organize courses (e.g., "Video Training Courses")
-  - 3-column responsive card layout with course covers (16:9 aspect ratio)
-  - Progress bars showing lesson completion percentage
-  - Lesson count badges on cards
-  - Admin buttons: Rearrange, Create Course (admin-only)
+ - Collapsible sections to organize courses (e.g., "Video Training Courses")
+ - 3-column responsive card layout with course covers (16:9 aspect ratio)
+ - Progress bars showing lesson completion percentage
+ - Lesson count badges on cards
+ - Admin buttons: Rearrange, Create Course (admin-only)
 - **Course Landing Page** (`/courses/[slug]`):
-  - Wide hero banner with title overlay and breadcrumbs
-  - Course description and module/lesson list as clickable links
-  - Right sidebar: "Pick up where you left off" card with next lesson and progress
-  - Direct links to each lesson (no accordion - opens dedicated lesson player)
+ - Wide hero banner with title overlay and breadcrumbs
+ - Course description and module/lesson list as clickable links
+ - Right sidebar: "Pick up where you left off" card with next lesson and progress
+ - Direct links to each lesson (no accordion - opens dedicated lesson player)
 - **Lesson Player** (`/courses/[slug]/lessons/[lessonId]`):
-  - Dedicated full-page lesson view with large 16:9 video player
-  - Breadcrumb navigation: Video Courses → Course → Lesson
-  - Lesson title, body content, and attachments below video
-  - "Next Lesson" CTA with encouraging message ("Nicely done! Let's keep it up!")
-  - Right sidebar: "All Lessons" grouped by module with completion indicators (checkmarks vs empty circles)
-  - Mobile responsive: sidebar becomes collapsible below video on small screens
-  - Mark complete button in sidebar
+ - Dedicated full-page lesson view with large 16:9 video player
+ - Breadcrumb navigation: Video Courses → Course → Lesson
+ - Lesson title, body content, and attachments below video
+ - "Next Lesson" CTA with encouraging message ("Nicely done! Let's keep it up!")
+ - Right sidebar: "All Lessons" grouped by module with completion indicators (checkmarks vs empty circles)
+ - Mobile responsive: sidebar becomes collapsible below video on small screens
+ - Mark complete button in sidebar
 
 ✅ **Admin Course Management**
 - **Course CRUD**:
-  - Create, edit, delete courses with sections support
-  - Section field to group courses in the catalog
-  - Banner URL with recommended 16:9 ratio guidance
-  - Simple rich text editor with formatting toolbar (Bold, Italic, Headings, Links, Lists)
-  - Assign courses to access groups
-  - Publish/unpublish courses
-  - Set custom locked messages and visibility (show_locked vs hide)
-  - Position/ordering for courses, modules, and lessons
+ - Create, edit, delete courses with sections support
+ - Section field to group courses in the catalog
+ - Banner URL with recommended 16:9 ratio guidance
+ - Simple rich text editor with formatting toolbar (Bold, Italic, Headings, Links, Lists)
+ - Assign courses to access groups
+ - Publish/unpublish courses
+ - Set custom locked messages and visibility (show_locked vs hide)
+ - Position/ordering for courses, modules, and lessons
 - **Admin Actions** (per course):
-  - **Progress**: View User Progress page showing enrollment and completion stats
-  - **Preview**: Opens course landing in new tab to preview member view
-  - **Modules**: Manage modules and lessons
-  - **Edit**: Update course details
-  - **Delete**: Remove course (with confirmation)
+ - **Progress**: View User Progress page showing enrollment and completion stats
+ - **Preview**: Opens course landing in new tab to preview member view
+ - **Modules**: Manage modules and lessons
+ - **Edit**: Update course details
+ - **Delete**: Remove course (with confirmation)
 - **View User Progress** (`/dashboard/courses/[courseId]/progress`):
-  - Table showing all enrolled students with:
-    - Name, email, enrollment date
-    - Progress bar and percentage
-    - Completed lessons count (e.g., "5/12 lessons")
-    - Last completed lesson and date
-  - Summary stats: Total Enrolled, Completed, Average Progress
+ - Table showing all enrolled students with:
+ - Name, email, enrollment date
+ - Progress bar and percentage
+ - Completed lessons count (e.g., "5/12 lessons")
+ - Last completed lesson and date
+ - Summary stats: Total Enrolled, Completed, Average Progress
 
 ✅ **Rich Text Editing**
 - Simple toolbar with formatting buttons: Bold, Italic, H2, H3, Link, Bullet List, Numbered List, Paragraph, Line Break
@@ -521,37 +593,37 @@ community-platform/
 
 1. **Log in as admin** and go to **Admin → Courses** (`/dashboard/courses`)
 2. **Create a course:**
-   - Click "New Course"
-   - Set title, slug, description
-   - Add banner image URL (recommended 16:9 ratio)
-   - Set section name (e.g., "Video Training Courses") for catalog grouping
-   - Set locked message and visibility (show_locked / hide)
-   - Assign to one or more access groups
-   - Mark as published when ready
-   - Click "Save"
+ - Click "New Course"
+ - Set title, slug, description
+ - Add banner image URL (recommended 16:9 ratio)
+ - Set section name (e.g., "Video Training Courses") for catalog grouping
+ - Set locked message and visibility (show_locked / hide)
+ - Assign to one or more access groups
+ - Mark as published when ready
+ - Click "Save"
 3. **Add modules:**
-   - Click "Modules" on the course row
-   - Click "New Module"
-   - Set title and description
-   - Click "Save"
+ - Click "Modules" on the course row
+ - Click "New Module"
+ - Set title and description
+ - Click "Save"
 4. **Add lessons:**
-   - Click "Lessons" within a module
-   - Click "New Lesson"
-   - Set title
-   - Use rich text editor toolbar to format lesson body (Bold, Italic, Links, Lists, Headings)
-   - Add video URL (YouTube, Vimeo, Loom embeds supported)
-   - Attachments: Add via JSON or upload to Supabase Storage (future)
-   - Click "Save"
+ - Click "Lessons" within a module
+ - Click "New Lesson"
+ - Set title
+ - Use rich text editor toolbar to format lesson body (Bold, Italic, Links, Lists, Headings)
+ - Add video URL (YouTube, Vimeo, Loom embeds supported)
+ - Attachments: Add via JSON or upload to Supabase Storage (future)
+ - Click "Save"
 5. **Preview & Monitor:**
-   - Click "Preview" to view course landing as a member
-   - Click "Progress" to see enrollment and completion statistics
+ - Click "Preview" to view course landing as a member
+ - Click "Progress" to see enrollment and completion statistics
 6. **Members access:**
-   - Members in assigned groups will see the course in their catalog at `/courses`
-   - They can enroll and start learning
-   - Auto-enrollment happens when users join linked groups
-   - Course catalog is grouped by sections with collapsible UI
+ - Members in assigned groups will see the course in their catalog at `/courses`
+ - They can enroll and start learning
+ - Auto-enrollment happens when users join linked groups
+ - Course catalog is grouped by sections with collapsible UI
 
-### What Changed in Phase 3 Polish (reference UX)
+### What Changed in Phase 3 Polish
 
 **Member Experience:**
 - ✅ Course catalog now has sections (collapsible groups)
@@ -572,8 +644,8 @@ community-platform/
 - ✅ Migration: `20240110000000_add_course_sections.sql` (adds `section` column)
 - ✅ Migration: `20240111000000_add_course_storage.sql` (Supabase Storage bucket + policies)
 - ✅ New routes:
-  - `/courses/[slug]/lessons/[lessonId]` - Lesson player
-  - `/dashboard/courses/[courseId]/progress` - Admin user progress
+ - `/courses/[slug]/lessons/[lessonId]` - Lesson player
+ - `/dashboard/courses/[courseId]/progress` - Admin user progress
 - ✅ New actions: `getLessonById()`, `getNextLesson()`, `getCourseUserProgress()`
 - ✅ New component: `SimpleRichTextEditor` (custom toolbar, no deps)
 
@@ -613,16 +685,16 @@ community-platform/
 ## Phase 6 Features (Admin Site Settings)
 
 ✅ **Site Settings Expansion**
-- Tabbed settings UI modeled after reference community settings (6 tabs)
+- Tabbed settings UI (6 tabs)
 - **General**: Community/site name, tagline, support email, direct messaging toggle, powered-by toggle
 - **Member Defaults**: Weekly digest toggle, pending user follow-ups toggle (email delivery in Phase 7)
 - **Navigation** ⭐ HIGH VALUE: Configure top-level nav items with:
-  - Enable/disable toggles per nav item
-  - Custom labels (e.g., "Video Courses" instead of "Courses")
-  - Group-based access control (comma-separated slugs like `free-members, paid-students`)
-  - Custom link support (add your own URLs)
-  - Dynamic sidebar rendering based on user's group membership
-  - Admins always see all enabled items; regular users see filtered items
+ - Enable/disable toggles per nav item
+ - Custom labels (e.g., "Video Courses" instead of "Courses")
+ - Group-based access control (comma-separated slugs like `free-members, paid-students`)
+ - Custom link support (add your own URLs)
+ - Dynamic sidebar rendering based on user's group membership
+ - Admins always see all enabled items; regular users see filtered items
 - **Sidebar**: Admin and user default sidebar widths (200-480px)
 - **Locked Content**: Enable toggle plus per-content-type locked messages (courses, channels, events, documents)
 - **Theme**: Primary accent color, logo URL, background color, gradient colors (start/end), sidebar gradient toggle
@@ -634,57 +706,57 @@ community-platform/
 ### How to Test Phase 6
 
 1. **Apply the migrations:**
-   ```bash
-   supabase db push
-   # Or manually execute:
-   # - supabase/migrations/20240108000000_add_site_settings.sql
-   # - supabase/migrations/20240109000000_add_navigation_and_theme_settings.sql
-   ```
+ ```bash
+ supabase db push
+ # Or manually execute:
+ # - supabase/migrations/20240108000000_add_site_settings.sql
+ # - supabase/migrations/20240109000000_add_navigation_and_theme_settings.sql
+ ```
 
 2. **Access settings as admin:**
-   - Log in as an admin user
-   - Go to `/dashboard/settings`
-   - Navigate through the six tabs: General, Member Defaults, Navigation, Sidebar, Locked Content, Theme
+ - Log in as an admin user
+ - Go to `/dashboard/settings`
+ - Navigate through the six tabs: General, Member Defaults, Navigation, Sidebar, Locked Content, Theme
 
 3. **Test General settings:**
-   - Change the community name and tagline
-   - Add a support email
-   - Toggle direct messaging and powered-by settings
-   - Save and verify the name appears in the sidebar and browser title
+ - Change the community name and tagline
+ - Add a support email
+ - Toggle direct messaging and powered-by settings
+ - Save and verify the name appears in the sidebar and browser title
 
 4. **Test Member Defaults:**
-   - Toggle weekly digest on/off
-   - Toggle pending user follow-ups (note the Phase 7 disclaimer)
-   - Save and verify persistence
+ - Toggle weekly digest on/off
+ - Toggle pending user follow-ups (note the Phase 7 disclaimer)
+ - Save and verify persistence
 
 5. **Test Navigation (HIGH VALUE):**
-   - View the default nav items (Dashboard, Video Courses, Events, Offers)
-   - Toggle nav items on/off
-   - Change labels (e.g., rename "Courses" to "Video Courses")
-   - Edit group access control:
-     - Enter comma-separated group slugs like `free-members, paid-students`
-     - Note: You must create matching access groups with these slugs
-     - Or edit to match existing group slugs in your database
-   - Add a custom link by clicking "+ Add Custom Link"
-   - Save and refresh to see sidebar update dynamically
-   - Test as different users in different groups to verify access filtering
-   - Verify admins see all enabled items
+ - View the default nav items (Dashboard, Video Courses, Events, Offers)
+ - Toggle nav items on/off
+ - Change labels (e.g., rename "Courses" to "Video Courses")
+ - Edit group access control:
+ - Enter comma-separated group slugs like `free-members, paid-students`
+ - Note: You must create matching access groups with these slugs
+ - Or edit to match existing group slugs in your database
+ - Add a custom link by clicking "+ Add Custom Link"
+ - Save and refresh to see sidebar update dynamically
+ - Test as different users in different groups to verify access filtering
+ - Verify admins see all enabled items
 
 6. **Test Sidebar settings:**
-   - Adjust admin and user default widths
-   - Save and verify new users get the updated defaults
+ - Adjust admin and user default widths
+ - Save and verify new users get the updated defaults
 
 7. **Test Locked Content:**
-   - Enable/disable locked messages
-   - Customize messages for each content type (courses, channels, events, documents)
-   - Save and verify the messages are used when content is locked
+ - Enable/disable locked messages
+ - Customize messages for each content type (courses, channels, events, documents)
+ - Save and verify the messages are used when content is locked
 
 8. **Test Theme:**
-   - Pick a primary accent color
-   - Add a logo URL (preview shows if valid)
-   - Set background color and gradient colors (start/end)
-   - Toggle sidebar gradient on/off
-   - Save and verify colors are stored
+ - Pick a primary accent color
+ - Add a logo URL (preview shows if valid)
+ - Set background color and gradient colors (start/end)
+ - Toggle sidebar gradient on/off
+ - Save and verify colors are stored
 
 ## Admin Preview Mode
 
@@ -700,19 +772,19 @@ community-platform/
 
 1. **Log in as admin** and navigate to **Admin → Preview Mode** in the sidebar
 2. **Select an access group:**
-   - Choose "Free Members" or "Paid Students" from the dropdown
-   - Note: Paid Students automatically includes Free Members access
-   - Click "Start Preview"
+ - Choose "Free Members" or "Paid Students" from the dropdown
+ - Note: Paid Students automatically includes Free Members access
+ - Click "Start Preview"
 3. **Preview the site:**
-   - A blue banner appears at the top: "Previewing community as [group]"
-   - Navigation is filtered to show only what that group would see
-   - Admin navigation remains visible so you can access Settings or exit
+ - A blue banner appears at the top: "Previewing community as [group]"
+ - Navigation is filtered to show only what that group would see
+ - Admin navigation remains visible so you can access Settings or exit
 4. **Switch groups:**
-   - Use the dropdown in the blue banner to switch between groups
-   - The UI refreshes to show the new group's view
+ - Use the dropdown in the blue banner to switch between groups
+ - The UI refreshes to show the new group's view
 5. **Exit preview:**
-   - Click "Exit Preview" in the banner to return to full admin view
-   - Or navigate to Preview Mode page and clear preview
+ - Click "Exit Preview" in the banner to return to full admin view
+ - Or navigate to Preview Mode page and clear preview
 
 ### Preview Mode Technical Details
 
@@ -752,7 +824,7 @@ community-platform/
 - Added recording_url column to events table for post-event recordings
 - Updated UserProfile type to include avatar_url field
 - Added admin toolbar with Preview/Event Details toggle and Edit/Send Blast buttons
-- Improved UX to match reference events reference design
+- Refined events UX
 - RSVP controls moved to detail page with better visual feedback
 - Zoom URL protection enforced (only shown if RSVP status is "going")
 - Cover image upload prompts visible to admins
@@ -802,11 +874,11 @@ Phase 6 adds client-to-team direct messaging and a coach dashboard for tracking 
 - Coaches see their assigned students
 - Admins see all students
 - Per-student view shows:
-  - All enrolled courses with progress percentage
-  - Total lessons vs completed lessons per course
-  - Last active date (from latest: user activity, DM, or lesson completion)
-  - Last lesson completed with title
-  - Quick link to open DM with student
+ - All enrolled courses with progress percentage
+ - Total lessons vs completed lessons per course
+ - Last active date (from latest: user activity, DM, or lesson completion)
+ - Last lesson completed with title
+ - Quick link to open DM with student
 - Detailed student view shows lesson-by-lesson progress per course
 - Admin can assign/unassign coaches to students (one coach per student)
 
@@ -841,52 +913,52 @@ Phase 6 adds client-to-team direct messaging and a coach dashboard for tracking 
 ### How to Test Phase 6
 
 1. **Apply the migration:**
-   ```bash
-   supabase db push
-   # Or manually execute: supabase/migrations/20260911140730_add_dms_and_coaches.sql
-   ```
+ ```bash
+ supabase db push
+ # Or manually execute: supabase/migrations/20260911140730_add_dms_and_coaches.sql
+ ```
 
 2. **Test Direct Messages as Client:**
-   - Log in as a client user
-   - Click "Messages" in the sidebar
-   - You'll be auto-redirected to your team thread
-   - Send a message to the team
-   - See unread badge update in realtime
+ - Log in as a client user
+ - Click "Messages" in the sidebar
+ - You'll be auto-redirected to your team thread
+ - Send a message to the team
+ - See unread badge update in realtime
 
 3. **Test Direct Messages as Admin/Coach:**
-   - Log in as an admin or coach
-   - Click "Messages" in the sidebar
-   - See list of all client threads with last message preview
-   - Click a thread to open the conversation
-   - Send a message to the client
-   - Create a new thread by searching for a client
-   - Unread count shows messages from clients
+ - Log in as an admin or coach
+ - Click "Messages" in the sidebar
+ - See list of all client threads with last message preview
+ - Click a thread to open the conversation
+ - Send a message to the client
+ - Create a new thread by searching for a client
+ - Unread count shows messages from clients
 
 4. **Test Coach Dashboard:**
-   - Log in as a coach
-   - Click "My Students" in the sidebar
-   - See your assigned students with course progress
-   - Click "View Progress" to see detailed lesson-by-lesson progress
-   - Click "Message" to open DM with that student
+ - Log in as a coach
+ - Click "My Students" in the sidebar
+ - See your assigned students with course progress
+ - Click "View Progress" to see detailed lesson-by-lesson progress
+ - Click "Message" to open DM with that student
 
 5. **Test Coach Assignment (Admin):**
-   - Log in as an admin
-   - Click "Students" in the sidebar
-   - Use the dropdown to assign coaches to students
-   - Each student can have only one coach
-   - Select "No coach" to unassign
+ - Log in as an admin
+ - Click "Students" in the sidebar
+ - Use the dropdown to assign coaches to students
+ - Each student can have only one coach
+ - Select "No coach" to unassign
 
 6. **Test Mobile Responsiveness:**
-   - Resize browser to mobile width (390px)
-   - Inbox should show either list OR thread, not both
-   - Navigation between list and thread should work
-   - Message composer should be usable on mobile
+ - Resize browser to mobile width (390px)
+ - Inbox should show either list OR thread, not both
+ - Navigation between list and thread should work
+ - Message composer should be usable on mobile
 
 ### Phase 6 Settings
 
 - `direct_messaging_enabled` (boolean) in `site_settings`:
-  - `true` (default): Clients can access and use DMs
-  - `false`: DMs hidden from clients; admins/coaches can still use coach dashboard and DMs
+ - `true` (default): Clients can access and use DMs
+ - `false`: DMs hidden from clients; admins/coaches can still use coach dashboard and DMs
 
 ### Known Gaps in Phase 6
 
@@ -987,7 +1059,7 @@ stripe listen --forward-to localhost:3000/api/stripe/webhook
 STRIPE_WEBHOOK_SECRET=whsec_...
 ```
 
-For production, create a webhook endpoint in Stripe Dashboard pointing to `https://yourdomain.com/api/stripe/webhook`.
+For production, create a webhook endpoint in Stripe Dashboard pointing to `https://your-domain.example.com/api/stripe/webhook`.
 
 #### 4. Create Products in Stripe
 
@@ -1003,10 +1075,10 @@ For production, create a webhook endpoint in Stripe Dashboard pointing to `https
 3. Create a new product group and link it to an access group (e.g., link to "Premium Members" access group)
 4. Go back to the "Products" tab
 5. Create a new product:
-   - Enter name, description, and sales pitch
-   - Paste the Stripe Product ID and Price ID
-   - Select which product groups it grants access to
-   - Set position and active status
+ - Enter name, description, and sales pitch
+ - Paste the Stripe Product ID and Price ID
+ - Select which product groups it grants access to
+ - Set position and active status
 6. Product will now appear on the `/dashboard/offers` page
 
 #### 6. Test Purchase Flow
@@ -1058,9 +1130,9 @@ For issues or questions:
 2. Review the [Next.js documentation](https://nextjs.org/docs)
 3. Open an issue in the GitHub repository
 
-## App Chrome / IA
+## Application Shell & Information Architecture
 
-✅ **reference-style Shell**
+✅ **Application Shell**
 - Light sidebar with community logo, name, and sectioned navigation
 - Top navigation: Pulse, Video Courses, Resources, Events, Members (admin), Support
 - Collapsible sections with group-based visibility (Free Members vs Paid Students)
@@ -1068,7 +1140,7 @@ For issues or questions:
 - Header bar: search, DM icon, notifications bell, settings gear, avatar menu
 - Right presence rail: stacked avatars of active users (12 max, hidden on mobile)
 - Mobile: full-width drawer with hamburger menu
-- Dark gray admin sidebar replaced with light reference-style chrome
+- Dark gray admin sidebar replaced with a light application shell
 
 ✅ **Admin Sidebar Management UI**
 - Settings → Sidebar tab: drag-and-drop reordering of sections and items
@@ -1098,7 +1170,7 @@ For issues or questions:
 - Search by name/email
 - User cards show: avatar, name, role badge, colored group badges
 - Admin edit panel: role, groups, active status
-- brand color palette for badges
+- Brand color palette for badges
 
 ✅ **Courses & Events in Shell**
 - /courses and /courses/[slug] wrapped in AppShell
@@ -1112,56 +1184,56 @@ For issues or questions:
 - Logo URL from site_settings
 - Default colors: primary #1E3A7A, gradient #EAF0FB→#FBF5D6
 
-### How to Test App Chrome
+### How to Test the Application Shell
 
 1. **Apply the migration:**
-   ```bash
-   supabase db push
-   # Or manually execute: supabase/migrations/20260912010000_app_shell_ia.sql
-   ```
+ ```bash
+ supabase db push
+ # Or manually execute: supabase/migrations/20260912010000_app_shell_ia.sql
+ ```
 
 2. **Create access groups (if not present):**
-   - Go to `/dashboard/groups` as admin
-   - Create groups with slugs: `free-members`, `paid-students`
-   - Assign users to groups to test visibility
+ - Go to `/dashboard/groups` as admin
+ - Create groups with slugs: `free-members`, `paid-students`
+ - Assign users to groups to test visibility
 
 3. **Test as admin:**
-   - Log in as admin
-   - Navigate through all pages: /pulse, /courses, /dashboard/members, /resources, /support
-   - Verify light sidebar, header bar, presence rail appear on all pages
-   - Go to `/dashboard/settings` → Sidebar tab
-   - Drag sections and items to reorder
-   - Edit an item's label, href, icon, or group visibility
-   - Add a new section or item
-   - Delete an item (with confirmation)
+ - Log in as admin
+ - Navigate through all pages: /pulse, /courses, /dashboard/members, /resources, /support
+ - Verify light sidebar, header bar, presence rail appear on all pages
+ - Go to `/dashboard/settings` → Sidebar tab
+ - Drag sections and items to reorder
+ - Edit an item's label, href, icon, or group visibility
+ - Add a new section or item
+ - Delete an item (with confirmation)
 
 4. **Test Preview Mode:**
-   - Go to `/dashboard/preview`
-   - Select "Free Members" from dropdown
-   - Verify COACHING section is hidden (it's paid-students only)
-   - Verify Wednesday Sessions and Live Support Schedule are hidden (paid-students only)
-   - Switch to "Paid Students"
-   - Verify COACHING section and extra INTERACTIVE TRAINING items appear
-   - Exit preview
+ - Go to `/dashboard/preview`
+ - Select "Free Members" from dropdown
+ - Verify COACHING section is hidden (it's paid-students only)
+ - Verify Wednesday Sessions and Live Support Schedule are hidden (paid-students only)
+ - Switch to "Paid Students"
+ - Verify COACHING section and extra INTERACTIVE TRAINING items appear
+ - Exit preview
 
 5. **Test as regular user:**
-   - Log out and create/log in as a regular client user
-   - Add user to `free-members` group (admin)
-   - Verify sidebar shows only Free Members content
-   - Remove from `free-members`, add to `paid-students`
-   - Verify sidebar shows Paid Students content (superset of Free)
+ - Log out and create/log in as a regular client user
+ - Add user to `free-members` group (admin)
+ - Verify sidebar shows only Free Members content
+ - Remove from `free-members`, add to `paid-students`
+ - Verify sidebar shows Paid Students content (superset of Free)
 
 6. **Test Mobile:**
-   - Resize browser to 390px width
-   - Verify sidebar collapses to hamburger menu
-   - Open menu, verify full sidebar in drawer
-   - Verify presence rail hidden on mobile
+ - Resize browser to 390px width
+ - Verify sidebar collapses to hamburger menu
+ - Open menu, verify full sidebar in drawer
+ - Verify presence rail hidden on mobile
 
 ## Documents (Admin-Editable Resources)
 
 ✅ **In-Place Document Editor**
 - Admin-editable documents replacing static `/resources/*` placeholders
-- reference-style editor: click Edit on any `/resources/[slug]` page to edit in-place
+- In-context editor: click Edit on any `/resources/[slug]` page to edit in place
 - Rich content: title, cover image (16:9 recommended), video embed (YouTube/Vimeo/Loom), HTML body, attachments
 - Simple formatting toolbar: bold, italic, H2/H3, links, lists, paragraphs
 - Access control: published toggle, locked message override, visibility (show_locked/hide), group-based access
@@ -1184,14 +1256,14 @@ For issues or questions:
 1. **Navigate to a resource** (e.g., `/resources/announcements`) via sidebar
 2. **Click Edit** (admin-only button in top-right)
 3. **Edit content:**
-   - Title and slug (slug locked after create)
-   - Cover image URL (16:9 aspect ratio recommended)
-   - Video URL (YouTube, Vimeo, Loom)
-   - Body using the formatting toolbar (bold, italic, headings, links, lists)
-   - Attachments (name, URL, type)
-   - Published toggle
-   - Locked message override and visibility (show_locked vs hide)
-   - Access groups (leave empty for all authenticated users)
+ - Title and slug (slug locked after create)
+ - Cover image URL (16:9 aspect ratio recommended)
+ - Video URL (YouTube, Vimeo, Loom)
+ - Body using the formatting toolbar (bold, italic, headings, links, lists)
+ - Attachments (name, URL, type)
+ - Published toggle
+ - Locked message override and visibility (show_locked vs hide)
+ - Access groups (leave empty for all authenticated users)
 4. **Click Save** to update (stays on same page)
 5. **View as member** using Preview As Group dropdown
 
@@ -1205,9 +1277,9 @@ When an admin adds a sidebar item with href `/resources/<slug>` (via Settings �
 
 ## Offers and Locked Content
 
-✅ **Reference-Style Paywall**
+✅ **Paywall**
 - Friendly lock cards with site-customizable messages per content type (courses, events, documents, channels)
-- Navy (#1E3A7A) primary CTA buttons matching the reference platform design
+- Navy (#1E3A7A) primary CTA buttons
 - Settings control: `locked_message_enabled` + per-type `locked_messages`
 - Single-product optimization: CTA shows product name when exactly one active product exists
 
@@ -1226,7 +1298,7 @@ When an admin adds a sidebar item with href `/resources/<slug>` (via Settings �
 ### Leftover / Not Implemented
 
 - Pulse is a stub feed (no attachments, polls, voice, or rich interactions)
-- **legacy content not migrated**: Document bodies are empty and need to be filled manually
+- **Content not seeded**: Document bodies start empty and are filled in through the admin editor
 - **Attachments are URLs only**: No built-in file picker or upload (admins enter URLs)
 - **No comments or reactions on documents**: Documents are read-only for members
 - Real-time presence (active users list is static, refreshed on page load)

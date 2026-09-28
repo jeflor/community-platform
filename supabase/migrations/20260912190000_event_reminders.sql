@@ -1,5 +1,5 @@
 -- Event Reminders Migration
--- Adds in-app reminders for upcoming events (reference-style)
+-- Adds in-app reminders for upcoming events
 -- Users with 'going' status get notified within 24 hours before event starts
 
 -- Add reminded_at column to track which RSVPs have been reminded

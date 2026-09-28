@@ -1,4 +1,4 @@
--- Create banners table for reference-style community banner slots
+-- Create banners table for community banner slots
 CREATE TABLE IF NOT EXISTS public.banners (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   title TEXT NOT NULL,

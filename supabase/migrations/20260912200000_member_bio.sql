@@ -1,5 +1,5 @@
 -- Add bio, headline, and location fields to users table
--- These fields allow members to add reference-style profile information
+-- These fields allow members to add richer profile information
 
 -- Add new columns
 ALTER TABLE users ADD COLUMN bio TEXT;

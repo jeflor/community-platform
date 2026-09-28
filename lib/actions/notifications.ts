@@ -14,7 +14,7 @@ export async function getNotifications(limit: number = 20) {
     return { notifications: [], unreadCount: 0 };
   }
 
-  // Create event reminders for upcoming events (reference-style)
+  // Create event reminders for upcoming events
   // This runs once per session when notifications are loaded
   // Returns count of reminders created, but we don't need to use it
   const { error: reminderError } = await supabase.rpc("create_due_event_reminders");

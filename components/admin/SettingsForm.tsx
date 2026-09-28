@@ -368,7 +368,7 @@ export function SettingsForm({ settings, availableGroups = [] }: SettingsFormPro
               </div>
               <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
                 <p className="text-sm text-blue-900">
-                  <strong>Email Delivery (Phase 7):</strong> Email notifications are scaffolded but require <code className="bg-blue-100 px-1.5 py-0.5 rounded text-xs">RESEND_API_KEY</code> environment variable to be set for live delivery. Contact Chris for the API key.
+                  <strong>Email Delivery (Phase 7):</strong> Email notifications are scaffolded but require <code className="bg-blue-100 px-1.5 py-0.5 rounded text-xs">RESEND_API_KEY</code> environment variable to be set for live delivery.
                 </p>
               </div>
             </div>

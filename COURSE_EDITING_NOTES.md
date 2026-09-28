@@ -1,8 +1,8 @@
-# Course Editing: Reference-Style In-Context Controls
+# Course Editing: In-Context Admin Controls
 
 ## What Was Implemented
 
-Added admin-only controls to course pages so admins can edit courses where they're viewing them, matching the reference platform's in-place editing pattern.
+Added admin-only controls to course pages so admins can edit courses where they're viewing them, following an in-place editing pattern.
 
 ### Changes Made
 

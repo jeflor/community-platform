@@ -1,4 +1,4 @@
--- Add top_nav site_settings for editable top navigation (reference-style)
+-- Add top_nav site_settings for editable top navigation
 -- This stores the top navigation items (Pulse, Video Courses, Resources, etc.)
 -- with customizable labels, visibility, and group access control
 

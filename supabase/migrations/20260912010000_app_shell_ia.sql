@@ -1,4 +1,4 @@
--- reference-style shell and IA
+-- Application shell and information architecture
 -- Adds sidebar_sections for configurable navigation and pulse_posts for Pulse feed
 
 -- Create sidebar_sections table for admin-editable navigation

@@ -1,4 +1,4 @@
--- Add reference-style fields to sidebar_items
+-- Add presentation fields to sidebar_items
 -- channel_type: threads (default, /resources/*), chat (hidden for now), voice (skip)
 -- read_only: boolean for read-only channels
 -- description: rich text description
